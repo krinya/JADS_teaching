@@ -1,0 +1,707 @@
+---
+title: "Telco Customer Churn"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+# Background, the business context
+
+In this challange the goal is to predict behavior of customers to retain them.
+
+Telephone service companies, Internet service providers, pay TV companies, insurance firms, and alarm monitoring services, often use customer attrition analysis and customer attrition rates as one of their key business metrics because the cost of retaining an existing customer is far less than acquiring a new one. Companies from these sectors often have customer service branches which attempt to win back defecting clients, because recovered long-term customers can be worth much more to a company than newly recruited clients.
+
+Predictive analytics use churn prediction models that predict customer churn by assessing their propensity of risk to churn. Since these models generate a small prioritized list of potential defectors, they are effective at focusing customer retention marketing programs on the subset of the customer base who are most vulnerable to churn.
+
+# Load some packeages
+
+```{r, message = FALSE}
+library(data.table)
+library(ggplot2)
+library(caret)
+```
+
+# Read in the data
+
+```{r}
+data <- fread(input = "D:/teaching/telco_customer_churn/data.csv")
+```
+
+Inspect it:
+
+```{r}
+head(data)
+```
+
+This is a very clean dataset in real life probably you are not going to meet data like this. But for demonstration this is ideal.
+
+```{r}
+data[, customerID:= NULL] #drop cutomerID
+```
+
+# Understand what we have
+
+Each row represents a customer, each column contains customer’s attributes described on the column Metadata.
+
+The data set includes information about:
+
+  * Customers who left within the last month – the column is called Churn
+  * Services that each customer has signed up for – phone, multiple lines, internet, online security, online backup, device protection, tech support, and streaming TV and movies
+  * Customer account information – how long they’ve been a customer, contract, payment method, paperless billing, monthly charges, and total charges
+  * Demographic info about customers – gender, age range, and if they have partners and dependents
+
+# EDA - Exploratory Data Analysis
+
+### Observation number:
+
+In other words: how many lines do we have?
+
+```{r}
+nrow(data)
+```
+
+We have data for 7043 customers.
+
+Lets look at some of the variables.
+
+## Missing values
+
+```{r, warning=FALSE}
+#install.packages("naniar")
+#install.packages("VIM")
+library(naniar)
+gg_miss_var(data)
+```
+
+
+We can see that we have missing values in the 'TotalCharges' columns. Lets look at them, we might figure out why they are missing.
+
+
+```{r}
+sum(is.na(data$TotalCharges))
+```
+
+```{r}
+data[is.na(TotalCharges)]
+```
+
+I cannot realy tell why they are missing. One of the reason can be that they have not been charged yet, they are in their first month of their contract.
+
+I replace the missing values with the median of the 'TotalCharges'.
+
+```{r}
+medianTotalCharges <- round(median(data$TotalCharges, na.rm = T))
+medianTotalCharges
+
+data[is.na(TotalCharges), TotalCharges:= medianTotalCharges]
+```
+
+```{r}
+sum(is.na(data))
+```
+
+## Variables:
+
+### Churn:
+
+This is the variable that we would like to predict.
+We would like to have a model which takes all the other variables and tells us whether a given person is going to churn in the next month or not, and the probability of this.
+
+How many and what is the prectiage of people who churned? 
+
+```{r}
+countingTable <- data[, .(N = .N), by = Churn]
+countingTable[, all:= sum(N, na.rm = T)]
+countingTable[, proportions:= N/all]
+countingTable[, proportions:= round(proportions, digits = 3)]
+countingTable
+```
+
+We can see that 27% of the customers in our data churned.
+
+We can plot this as well:
+
+```{r}
+ggplot(countingTable, aes(x = Churn, y = proportions)) +
+  geom_bar(stat = "identity") +
+  theme_bw()
+```
+
+We can see that this is an unbalanced dataset, but not that much. It is useful to know how unbalanced our data for choosing the right workflow, alorithm and evaluation method, etc.
+
+Also, I am creating a new variable called 'churnNumeric' based on our 'Churn' variable based on this rule:
+
+  * If 'Churn' is 'Yes' I am assigning 1 to it
+  * If 'Churn' is 'No' I am assingin 0 to it
+  
+It will come handy later.
+  
+```{r}
+data[, churnNumeric:= ifelse(Churn == "Yes", 1, 0)]
+```
+
+## Gender
+
+
+```{r}
+countingTableGender <- data[, .(N = .N), by = gender]
+countingTableGender[, all:= sum(N, na.rm = T)]
+countingTableGender[, proportions:= N/all]
+countingTableGender[, proportions:= round(proportions, digits = 3)]
+countingTableGender
+
+```
+
+Equal amount of males and females.
+
+### Does gender has an influence on Churn?
+
+To see this we can calculate the proportions of churn by gender:
+
+```{r}
+countingTableGenderProportions <- data[, .N, by = .(gender, Churn)]
+countingTableGenderProportions[, allByGender:= sum(N, na.rm = T), by = gender]
+countingTableGenderProportions[, proportions:=N/allByGender]
+countingTableGenderProportions[, proportions:=round(proportions, digits = 3)]
+countingTableGenderProportions
+```
+
+Almost the same proportion of males and fames churned: 26.2% vs 26.9%.
+It seems like gender is not an important variable when it comes to churn.
+
+## MonthlyCharges
+
+```{r}
+summary(data$MonthlyCharges)
+```
+
+
+```{r}
+ggplot(data, aes(MonthlyCharges)) +
+  geom_histogram(binwidth = 5) +
+  theme_bw()
+```
+
+We can calculate the proportions of Churn by 'MonthlyCharges' groups. What do we need for that one?
+
+Groups.
+
+So lets create groups first. We can do that in many ways, but for now I will do it manualy wtih arbitrary values:
+
+  * If 'MonthlyCharges' < 25 then 1
+  * If 25 <= 'MonthlyCharges' < 50 then 2
+  * If 50 <= 'MonthlyCharges' < 75 then 3
+  * If 75 <= 'MonthlyCharges' < 100 then 4
+  * If 100 <= 'MonthlyCharges' then 5
+  
+I am ending up with 5 groups.
+
+```{r}
+data[, MonthlyChargesGroup:= cut(as.numeric(MonthlyCharges),
+                                 breaks = c(min(MonthlyCharges - 1), 25, 50, 75, 100, max(MonthlyCharges + 1)),
+                                 labels = c(1, 2, 3, 4, 5),
+                                 right = F)]
+```
+
+```{r}
+table(data$MonthlyCharges, data$MonthlyChargesGroup)[75:100, ]
+```
+
+```{r}
+data$MonthlyChargesGroup <- as.numeric(data$MonthlyChargesGroup)
+data$MonthlyCharges <- as.numeric(data$MonthlyCharges)
+```
+
+Now we have groups. We can calculate the proportion of churn in each group. Now our binary (1/0) variable - 'churnNumeric' -  what we created before based on the 'Churn' variables is hand. Because we can take the mean of them within each group and that will give us the proportion of churn.
+
+```{r}
+meanChurnByGroup <- data[order(MonthlyChargesGroup), .(meanChurn = mean(churnNumeric, na.rm = T)), by = MonthlyChargesGroup]
+meanChurnByGroup
+```
+
+```{r}
+ggplot(meanChurnByGroup, aes(x = MonthlyChargesGroup, y = meanChurn)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Monthly Chareges Group", y = "Proportion of Churn") +
+  theme_bw()
+```
+
+## Doing it for all the varialbe is tedious
+
+Now, as you get the concept you can to the same for every variable manualy to get familiar with your data. Maybe createing a fucktion is handy and saves you a lot of work.
+
+OR
+
+You can use packages which simplyfies your work. I will show you some example here:
+
+```{r, message=FALSE, warning=FALSE}
+#install.packages("SmartEDA")
+library(SmartEDA)
+```
+
+```{r}
+ExpData(data=data,type=1)
+```
+
+```{r}
+ExpData(data=data, type=2)
+```
+
+```{r}
+ExpNumStat(data, by="A", gp=NULL,  Qnt = seq(0,1, 0.2), MesofShape = 2, Outlier = TRUE, round = 2)
+```
+
+```{r}
+ExpNumStat(data, by="G", gp="Churn",  Qnt = seq(0,1, 0.2), MesofShape = 2, Outlier = TRUE, round = 2)
+```
+
+```{r, warning=FALSE, message= F}
+ExpNumViz(data, target="Churn", type = 2, nlim = 25, col = c("DarkGreen", "Red"))
+```
+
+```{r}
+ExpCTable(data, Target="Churn", margin=1, clim=10, nlim=5, round=2, bin=NULL, per=TRUE)
+```
+
+```{r}
+ExpCatStat(data ,Target="Churn",result = "Stat", clim=10, nlim=5, Pclass="Yes")
+```
+
+```{r}
+ExpCatViz(data,target="Churn", col = c("DarkGreen", "Red"), margin = 2)
+```
+
+## Another approach
+
+
+```{r}
+featurePlot(x = data[, c(2:5)], 
+            y = data$Churn, 
+            plot = "box",
+            strip=strip.custom(par.strip.text=list(cex=.7)),
+            scales = list(x = list(relation="free"), 
+                          y = list(relation="free")))
+```
+
+
+
+# Modeling part
+
+In this part I am going to build a model following these steps:
+
+  * split the data into train and test set
+  * create some models on the train set and evaluate them the test set
+  * evaluate the models and pick the best one
+  
+Remember what we are doing:
+
+We would like to create an alorithm (a model) which tells us: given the features that we have in our data whether a person is going to churn or not. Or in other words, we would like to predict what is chance that a person is going to churn in the next month.
+
+## Create train and test datasets
+
+In this part I am splitting the data into train and test set.
+
+Why? To be able to evaluate my model on unseen data. In this way, I hold out the test set while createing my model on the train set. With the help of this method I can make sure that my model is acting the similar way as on the training data. In more data science terms I can make sure that I chose model parameters as it is not overfiting (or underfitting) my data.
+
+I will show you some examples what I mean under that.
+
+```{r}
+set.seed(314)
+```
+
+
+```{r}
+#caret package
+train_instances <- createDataPartition(data$Churn, p = 0.8, list = F)
+
+train_instances[1:10]
+
+dataTrain <- data[train_instances, ]
+dataTest <- data[-train_instances]
+```
+
+Original row count in the data
+
+```{r}
+print("Original row count in the data")
+nrow(data)
+```
+
+Train row count
+
+```{r}
+nrow(dataTrain)
+```
+
+Test row count
+
+```{r}
+nrow(dataTest)
+```
+
+Train + Test rows sum are equal original data rows
+
+```{r}
+nrow(data) == nrow(dataTrain) + nrow(dataTest)
+```
+
+## Using the 'caret' package:
+
+Now comes the important stage where you actually build the machine learning model.
+
+To know what models caret supports, run the following:
+
+```{r}
+# See available algorithms in caret
+modelnames <- paste(names(getModelInfo()), collapse=',  ')
+modelnames
+```
+
+Each of those is a machine learning algorithm caret supports.
+
+Yes, it’s a huge list!
+
+And if you want to know more details like the hyperparameters and if it can be used of regression or classification problem, then do a 'modelLookup(algo)'.
+
+```{r}
+modelLookup(c('glmnet'))
+modelLookup(c('knn'))
+```
+
+Once you have chosen an algorithm, building the model is fairly easy with caret.
+
+```{r}
+dataTrain[, churnNumeric:= NULL]
+```
+
+## Chaeck the data once more
+
+```{r}
+head(dataTrain)
+```
+
+
+## Set up Cross Validation
+
+```{r}
+train_control <- trainControl(method = "cv",
+                              number = 10,
+                              classProbs = TRUE,
+                              summaryFunction = twoClassSummary,
+                              verboseIter = FALSE, # no training log
+                              allowParallel = TRUE # FALSE for reproducible results
+                              )
+```
+
+## Model 1: Decision Tree
+
+```{r}
+rpartGrid <- expand.grid(cp=seq(0, 0.01, 0.001)) 
+```
+
+```{r}
+decisonTreeModel <- train(Churn ~ .,
+               data=dataTrain,
+               trControl=train_control,
+               method = "rpart",
+               tuneGrid = rpartGrid,
+               metric = "ROC")
+
+decisonTreeSmall <- train(Churn ~ .,
+               data=dataTrain,
+               trControl=train_control,
+               method = "rpart",
+               tuneGrid = expand.grid(cp=seq(0.0075, 0.01, 0.001)),
+               metric = "ROC")
+```
+
+```{r}
+decisonTreeModel
+```
+
+
+```{r}
+plot(decisonTreeModel)
+```
+
+```{r}
+#install.packages("rattle")
+library(rattle)
+fancyRpartPlot(decisonTreeModel$finalModel)
+```
+
+```{r}
+fancyRpartPlot(decisonTreeSmall$finalModel)
+```
+
+## Model 2: ElasticNet - Lasso and Ridge models combined
+
+   * If alpha = 1 that is a Lasso regression
+   * If alpha = 0 that is a Ridge regression
+   
+Elasticnet combines both
+
+```{r}
+elasticGrid <- expand.grid(alpha=c(0, 0.05, 0.1, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9,  1), lambda = c(0, 0.1, 0.25, 0.5, 0.75, 1)) 
+elasticGrid
+```
+
+```{r}
+elasticNet <- train(Churn ~ .,
+               data=dataTrain,
+               trControl=train_control,
+               method = "glmnet",
+               tuneGrid = elasticGrid,
+               metric = "ROC")
+```
+
+```{r}
+elasticNet
+```
+
+## Model 3: Random Forest
+
+
+```{r}
+length(colnames(dataTrain))
+
+rfGrid <- expand.grid(mtry=c(3, 5, 10, 15, 20))
+```
+
+```{r}
+rfGrid
+```
+
+
+```{r}
+randomForestModel <- train(Churn ~ .,
+                           data = dataTrain,
+                           trControl = train_control,
+                           method = "rf",
+                           tuneGrid = rfGrid,
+                           metric = "ROC")
+```
+
+```{r}
+randomForestModel
+```
+
+```{r}
+rfGrid <- expand.grid(mtry=c(1:6))
+```
+```{r}
+rfGrid
+```
+
+
+```{r}
+randomForestModel <- train(Churn ~ .,
+                           data = dataTrain,
+                           trControl = train_control,
+                           method = "rf",
+                           tuneGrid = rfGrid,
+                           metric = "ROC")
+```
+
+```{r}
+randomForestModel
+```
+
+```{r}
+varImp(randomForestModel)
+```
+
+```{r}
+plot(varImp(randomForestModel))
+```
+
+# Model 4: xgboost
+
+```{r}
+# Tested the above setting in local machine
+xgbGrid <- expand.grid(nrounds = c(1000),
+                        max_depth = c(3, 4),
+                        eta = c(0.01),
+                        gamma = c(0.01, 0.05),
+                        colsample_bytree = 0.75,
+                        min_child_weight = 0,
+                        subsample = 0.5)
+
+#nrounds: Number of trees, default: 100
+#max_depth: Maximum tree depth, default: 6
+#eta: Learning rate, default: 0.3
+#gamma: Used for tuning of Regularization, default: 0
+#colsample_bytree: Column sampling, default: 1
+#min_child_weight: Minimum leaf weight, default: 1
+#subsample: Row sampling, default: 1
+
+xgboostModel <- train(Churn ~ .,
+                      data = dataTrain,
+                      trControl = train_control,
+                      method = "xgbTree",
+                      tuneGrid = xgbGrid,
+                      metric = "ROC",
+                      verbose = TRUE)
+```
+
+```{r}
+xgboostModel
+```
+
+# Prediction on the train set
+
+Now that we have our models we can see how they performe on the train set.
+
+BE CAREFUL: this is on your train set on seen data. It still might be that someting went wrong. (The chance is low since we did cross validation but still).
+If we want to evaluate our model we should do that in the test set, what we are going to do next.
+
+```{r}
+dataTrain[, dectree:=predict(decisonTreeModel, newdata = dataTrain)]
+dataTrain[, dectree_prob:=predict(decisonTreeModel, newdata = dataTrain, type = "prob")[, "Yes"]]
+dataTrain[, dectreeNumeric:= ifelse(dectree_prob > 0.5, 1, 0)]
+
+dataTrain[, elastic:=predict(elasticNet, newdata = dataTrain)]
+dataTrain[, elastic_prob:=predict(elasticNet, newdata = dataTrain, type = "prob")[, "Yes"]]
+dataTrain[, elastic_numeric:= ifelse(elastic_prob > 0.5, 1, 0)]
+
+dataTrain[, rf:= predict(randomForestModel, newdata = dataTrain)]
+dataTrain[, rf_prob:=predict(randomForestModel, newdata = dataTrain, type = "prob")[, "Yes"]]
+dataTrain[, rfNumeric:= ifelse(rf_prob > 0.5, 1, 0)]
+
+dataTrain[, xgboost:= predict(xgboostModel, newdata = dataTrain)]
+dataTrain[, xg_prob:=predict(xgboostModel, newdata = dataTrain, type = "prob")[, "Yes"]]
+dataTrain[, xgNumeric:= ifelse(xg_prob > 0.5, 1, 0)]
+```
+
+```{r}
+head(dataTrain)
+```
+
+
+Get the accuracy of each model on the train set:
+
+```{r}
+mean(dataTrain$Churn == dataTrain$dectree)
+mean(dataTrain$Churn == dataTrain$elastic)
+mean(dataTrain$Churn == dataTrain$rf)
+mean(dataTrain$Churn == dataTrain$xgboost)
+
+```
+
+
+# Predict on the test set
+
+```{r}
+dataTest[, dectree:=predict(decisonTreeModel, newdata = dataTest)]
+dataTest[, dectree_prob:=predict(decisonTreeModel, newdata = dataTest, type = "prob")[, "Yes"]]
+dataTest[, dectreeNumeric:= ifelse(dectree_prob > 0.5, 1, 0)]
+
+dataTest[, elastic:=predict(elasticNet, newdata = dataTest)]
+dataTest[, elastic_prob:=predict(elasticNet, newdata = dataTest, type = "prob")[, "Yes"]]
+dataTest[, elasticNumeric:= ifelse(elastic_prob > 0.5, 1, 0)]
+
+dataTest[, rf:= predict(randomForestModel, newdata = dataTest)]
+dataTest[, rf_prob:=predict(randomForestModel, newdata = dataTest, type = "prob")[, "Yes"]]
+dataTest[, rfNumeric:= ifelse(rf_prob > 0.5, 1, 0)]
+
+dataTest[, xgboost:= predict(xgboostModel, newdata = dataTest)]
+dataTest[, xg_prob:=predict(xgboostModel, newdata = dataTest, type = "prob")[, "Yes"]]
+dataTest[, xgNumeric:= ifelse(xg_prob > 0.5, 1, 0)]
+```
+
+```{r}
+head(dataTest)
+```
+
+# Evaluate and selecting the best model using the test set:
+
+## Calculate ROC on the test set:
+
+Install 'PRROC' package that calculates the ROC curve (and the AUC)
+
+```{r}
+#install.packages("PRROC")
+library(PRROC)
+```
+
+### ROC DecisionTree:
+
+```{r}
+roc.curve(scores.class0 = dataTest$dectree_prob, weights.class0=dataTest$churnNumeric)
+```
+
+### ROC ElasticNet:
+
+```{r}
+roc.curve(scores.class0 = dataTest$elastic_prob, weights.class0=dataTest$churnNumeric)
+```
+
+
+### ROC RandomForest:
+
+```{r}
+roc.curve(scores.class0 = dataTest$rf_prob, weights.class0=dataTest$churnNumeric)
+```
+
+### ROC xgBoost
+
+```{r}
+roc.curve(scores.class0 = dataTest$xg_prob, weights.class0=dataTest$churnNumeric)
+```
+
+## Calculate Confusion Matrix:
+
+<center><img
+src="D:/teaching/telco_customer_churn/cm.jpg">
+</center>
+
+## CM for DecisionTree: 
+
+```{r}
+confusionMatrix(as.factor(dataTest$dectreeNumeric), as.factor(dataTest$churnNumeric), #mode = "prec_recall"
+                positive = "1",
+                
+                )
+```
+
+## CM for ElasticNet: 
+
+```{r}
+confusionMatrix(as.factor(dataTest$elasticNumeric), as.factor(dataTest$churnNumeric), #mode = "prec_recall"
+                positive = "1",
+                
+                )
+```
+
+## CM for RandomForest: 
+```{r}
+confusionMatrix(as.factor(dataTest$rfNumeric), as.factor(dataTest$churnNumeric), #mode = "prec_recall",
+                positive = "1")
+```
+
+## CM for xgBoost: 
+```{r}
+confusionMatrix(as.factor(dataTest$xgNumeric), as.factor(dataTest$churnNumeric), #mode = "prec_recall",
+                positive = "1")
+```
+
+## Calibration Curve
+
+```{r}
+cal_obj <- calibration(factor(churnNumeric, levels = c("1", "0")) ~ dectree_prob + elastic_prob + rf_prob + xg_prob,
+                       data = dataTest,
+                       cuts = 10)
+
+plot(cal_obj,
+     type = "l",
+     auto.key = list(columns = 3,
+                     lines = TRUE,
+                     points = FALSE),
+     main = "Calibration Curves for each model")
+
+```
+
+# Which model to choose?
+
+
